@@ -7,38 +7,72 @@ import kotlinx.serialization.Serializable
  *
  * All messages are JSON-serialized and then encrypted with the Noise/Age
  * session key before transmission.
+ *
+ * Protocol-Version: 1 (MESHAI_PROTO_V1)
+ *
+ * Invariants enforced at construction:
+ *   SPEC_REF: MESH-001 — signature must be present before send (enforced in MeshNetwork)
+ *   SPEC_REF: MESH-002 — nonce must be unique per message (checked by SeenNonceCache)
+ *   SPEC_REF: MESH-003 / INV-008 — ttl must be in range 1..5
  */
 @Serializable
 data class MeshMessage(
     val messageId: String,
     val originNodeId: String,
-    val targetNodeId: String?,          // null = broadcast
+    val targetNodeId: String?,     // null = broadcast
     val type: MessageType,
-    val payload: String,                // JSON-encoded payload, type-specific
+    val payload: String,           // JSON-encoded, type-specific
     val timestamp: Long = System.currentTimeMillis(),
-    val ttl: Int = 5                    // Max hops in mesh routing
-)
+
+    /**
+     * SPEC_REF: MESH-003 / INV-008
+     * TTL must be 1..5 at creation. Nodes decrement on forward; drop at 0.
+     */
+    val ttl: Int = 5,
+
+    /**
+     * SPEC_REF: MESH-002 — unique per-message nonce for replay protection.
+     * Must be validated against SeenNonceCache before processing.
+     */
+    val nonce: String = generateNonce(),
+
+    /**
+     * SPEC_REF: MESH-001 — cryptographic signature over the message content.
+     * Null until [com.meshai.mesh.MeshEncryption.sign] is called.
+     * MeshNetwork MUST reject unsigned messages.
+     */
+    val signature: String? = null
+) {
+    init {
+        // SPEC_REF: MESH-003 / INV-008 — enforce TTL range at construction time
+        require(ttl in 1..5) {
+            "SPEC VIOLATION: MESH-003 / INV-008 — TTL must be 1..5, was $ttl"
+        }
+    }
+
+    companion object {
+        private fun generateNonce(): String =
+            java.util.UUID.randomUUID().toString()
+
+        /**
+         * Create a signed copy of this message.
+         * SPEC_REF: MESH-001
+         */
+        fun MeshMessage.assertSigned() {
+            require(signature != null) {
+                "SPEC VIOLATION: MESH-001 / INV-004 — message must be signed before transmission"
+            }
+        }
+    }
+}
 
 @Serializable
 enum class MessageType {
-    /** Node announces itself with capabilities */
     NODE_ANNOUNCEMENT,
-
-    /** Delegate a task to another node */
     TASK_DELEGATE,
-
-    /** Result of a completed task */
     TASK_RESULT,
-
-    /** Shared memory/knowledge base gossip */
     MEMORY_SYNC,
-
-    /** Heartbeat / keep-alive */
     HEARTBEAT,
-
-    /** Natural language message (owner-to-owner relay) */
     MESSAGE_RELAY,
-
-    /** Emergency broadcast */
     ALERT
 }

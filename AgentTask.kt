@@ -1,53 +1,30 @@
 package com.meshai.agent
 
-import kotlinx.serialization.Serializable
-import java.util.UUID
-
 /**
- * A unit of work the agent must complete.
+ * Represents a unit of work for the agent to complete.
  *
- * Tasks are created by the user (via Goals) or by other agents delegating
- * work across the mesh.
+ * SPEC_REF: SAFETY-002 / SAFETY-004
+ * [origin] and [ownerApproved] are evaluated by SafetyGate before any tool execution.
  */
-@Serializable
 data class AgentTask(
-    val taskId: String = UUID.randomUUID().toString(),
+    val taskId: String,
     val title: String,
     val description: String,
-    val type: TaskType,
     val priority: TaskPriority = TaskPriority.NORMAL,
-    val status: TaskStatus = TaskStatus.PENDING,
-    val originNodeId: String? = null,     // Which node created this task
-    val assignedNodeId: String? = null,   // Which node is executing it
-    val createdEpoch: Long = System.currentTimeMillis(),
-    val completedEpoch: Long? = null,
-    val result: String? = null,           // Natural-language result summary
-    val subTasks: List<AgentTask> = emptyList()
+
+    /**
+     * SPEC_REF: SAFETY-002
+     * Where this task originated. Remote tasks are subject to stricter tool restrictions
+     * (e.g. send_sms is denied for REMOTE origin — INV-002).
+     */
+    val origin: TaskOrigin = TaskOrigin.LOCAL,
+
+    /**
+     * SPEC_REF: SAFETY-004
+     * Whether the owner explicitly approved this task before becoming unavailable.
+     * Required to allow irreversible actions when owner is absent (INV-006).
+     */
+    val ownerApproved: Boolean = false
 )
 
-@Serializable
-enum class TaskType {
-    SEND_SMS,
-    ANSWER_CALL,
-    TAKE_PHOTO,
-    GET_LOCATION,
-    MONITOR,            // Ongoing sensor watch
-    RESPOND_TO_MESSAGE,
-    LLM_REASONING,      // Pure reasoning/planning task
-    DELEGATE,           // Route to another mesh node
-    CUSTOM              // User-defined goal
-}
-
-@Serializable
-enum class TaskPriority {
-    LOW, NORMAL, HIGH, CRITICAL
-}
-
-@Serializable
-enum class TaskStatus {
-    PENDING,
-    IN_PROGRESS,
-    COMPLETED,
-    FAILED,
-    DELEGATED    // Handed off to another mesh node
-}
+enum class TaskPriority { LOW, NORMAL, HIGH, CRITICAL }

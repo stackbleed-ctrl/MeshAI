@@ -4,7 +4,6 @@ import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
 import android.telephony.SmsManager
-import android.telephony.SmsMessage
 import androidx.core.content.ContextCompat
 import com.meshai.tools.AgentTool
 import com.meshai.tools.ToolResult
@@ -16,13 +15,19 @@ import javax.inject.Inject
 import javax.inject.Singleton
 
 /**
- * Agent tool for sending and reading SMS messages.
+ * Agent tool for sending SMS messages.
  *
- * Permissions required:
- * - SEND_SMS — for sending
- * - READ_SMS + RECEIVE_SMS — for reading
+ * SPEC_REF: SAFETY-002 / INV-002
+ * This tool is DENIED by SafetyGate when the task origin is REMOTE.
+ * That check occurs in ToolExecutionGuard → SafetyGate before this class
+ * is ever called.
  *
- * Gracefully fails with a clear message if permissions are not granted.
+ * SPEC_REF: SAFETY-004 / INV-006
+ * [isIrreversible] = true signals SafetyGate to deny execution when the
+ * owner is absent and has not pre-approved the task.
+ *
+ * SPEC_REF: TOOL-002 / TOOL-003 / TOOL-004
+ * Input validated; permission checked; returns ToolResult in all paths.
  */
 @Singleton
 class SmsTool @Inject constructor(
@@ -33,13 +38,20 @@ class SmsTool @Inject constructor(
     override val description = "Send an SMS message to a phone number"
     override val inputSchema = """{"to": "phone number string", "message": "text to send"}"""
 
+    /**
+     * SPEC_REF: SAFETY-004 — SMS is irreversible; owner must be present or pre-approve.
+     */
+    override val isIrreversible = true
+
     @Suppress("DEPRECATION")
     override suspend fun execute(jsonInput: String): ToolResult {
+        // SPEC_REF: TOOL-003 — permission gate before any action
         if (!hasPermission(Manifest.permission.SEND_SMS)) {
             return ToolResult.failure("SEND_SMS permission not granted. Ask user to grant it in settings.")
         }
 
         return try {
+            // SPEC_REF: TOOL-002 — validate input before execution
             val input = Json.decodeFromString<SmsInput>(jsonInput)
             if (input.to.isBlank() || input.message.isBlank()) {
                 return ToolResult.failure("'to' and 'message' fields are required")
@@ -53,17 +65,12 @@ class SmsTool @Inject constructor(
                 SmsManager.getDefault()
             }
 
-            // Split message if it exceeds 160 chars
             val parts = smsManager.divideMessage(input.message)
-            smsManager.sendMultipartTextMessage(
-                input.to,
-                null,
-                parts,
-                null,
-                null
-            )
+            smsManager.sendMultipartTextMessage(input.to, null, parts, null, null)
 
             Timber.i("[SmsTool] Sent SMS to ${input.to} (${input.message.length} chars)")
+
+            // SPEC_REF: TOOL-004 — success only when action completes
             ToolResult.success(
                 "SMS sent to ${input.to}",
                 mapOf("to" to input.to, "chars" to input.message.length.toString())

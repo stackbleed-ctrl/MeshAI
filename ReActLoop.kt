@@ -1,5 +1,6 @@
 package com.meshai.agent
 
+import com.meshai.agent.safety.KillSwitch
 import com.meshai.llm.LlmEngine
 import com.meshai.llm.LlmMessage
 import com.meshai.llm.LlmRole
@@ -17,23 +18,28 @@ import javax.inject.Singleton
  * The loop follows the pattern:
  *   Thought → Action → Observation → Thought → ... → Final Answer
  *
- * At each step:
- * 1. Build context (task description, memory, available tools, previous steps)
- * 2. Ask LLM to produce a Thought and an Action (tool call or final answer)
- * 3. Execute the action via [ToolRegistry]
- * 4. Record the Observation
- * 5. Repeat until the LLM signals a final answer or max steps reached
+ * Protocol-Version: 1 (MESHAI_PROTO_V1)
+ *
+ * Safety invariants enforced here:
+ *   SPEC_REF: LOOP-001 — MAX_STEPS = 12 (INV-007)
+ *   SPEC_REF: LOOP-002 — FINAL_ANSWER_SIGNAL is the only valid termination signal
+ *   SPEC_REF: LOOP-003 — tools are only invoked via ToolRegistry.executeTool()
+ *   SPEC_REF: LOOP-004 — observations stored in AgentMemory
+ *   SPEC_REF: SAFETY-003 — KillSwitch checked each iteration
  */
 @Singleton
 class ReActLoop @Inject constructor(
     private val llmEngine: LlmEngine,
     private val toolRegistry: ToolRegistry,
-    private val agentMemory: AgentMemory
+    private val agentMemory: AgentMemory,
+    // SPEC_REF: SAFETY-003 — KillSwitch injected to allow per-step halting
+    private val killSwitch: KillSwitch
 ) {
 
     companion object {
+        // SPEC_REF: INV-007 / LOOP-001 — hard ceiling, never increase without spec change
         private const val MAX_STEPS = 12
-        private val FINAL_ANSWER_SIGNAL = "FINAL ANSWER:"
+        private const val FINAL_ANSWER_SIGNAL = "FINAL ANSWER:"
     }
 
     private val _loopState = MutableStateFlow<LoopState>(LoopState.Idle)
@@ -50,27 +56,32 @@ class ReActLoop @Inject constructor(
         val history = mutableListOf<LlmMessage>()
         val systemPrompt = buildSystemPrompt(localNode)
 
-        // Initial user message: the task
         history.add(LlmMessage(LlmRole.USER, buildTaskPrompt(task)))
 
         var step = 0
         var finalAnswer: String? = null
 
+        // SPEC_REF: LOOP-001 / INV-007 — MAX_STEPS is enforced as the hard ceiling
         while (step < MAX_STEPS && finalAnswer == null) {
             step++
             Timber.d("[ReAct] Step $step/$MAX_STEPS")
 
-            // Ask LLM for next thought/action
+            // SPEC_REF: SAFETY-003 — check KillSwitch at the top of every iteration
+            if (killSwitch.isHalted) {
+                Timber.e("[ReAct] KillSwitch active — halting loop (SPEC_REF: SAFETY-003)")
+                _loopState.value = LoopState.Error(task, "Halted by KillSwitch")
+                return "Execution halted by KillSwitch"
+            }
+
             val llmResponse = llmEngine.complete(
                 systemPrompt = systemPrompt,
                 messages = history
             )
             Timber.d("[ReAct] LLM response: $llmResponse")
 
-            // Record assistant turn
             history.add(LlmMessage(LlmRole.ASSISTANT, llmResponse))
 
-            // Check for final answer signal
+            // SPEC_REF: LOOP-002 — only this signal terminates the loop
             if (llmResponse.contains(FINAL_ANSWER_SIGNAL)) {
                 finalAnswer = llmResponse
                     .substringAfter(FINAL_ANSWER_SIGNAL)
@@ -78,30 +89,30 @@ class ReActLoop @Inject constructor(
                 break
             }
 
-            // Parse tool call from response
             val toolCall = parseToolCall(llmResponse)
             if (toolCall != null) {
                 val (toolName, toolInput) = toolCall
                 Timber.d("[ReAct] Calling tool: $toolName with input: $toolInput")
 
+                // SPEC_REF: LOOP-003 / INV-005 / SAFETY-001
+                // Tools are ONLY invoked via ToolRegistry, which routes through
+                // ToolExecutionGuard → SafetyGate. Direct AgentTool calls are forbidden.
                 val toolResult: ToolResult = try {
-                    toolRegistry.executeTool(toolName, toolInput)
+                    toolRegistry.executeTool(toolName, toolInput, task, localNode)
                 } catch (e: Exception) {
                     Timber.e(e, "[ReAct] Tool execution failed")
                     ToolResult.failure("Tool error: ${e.message}")
                 }
 
-                // Store observation in history
                 val observationMsg = "Observation: ${toolResult.summary}"
                 history.add(LlmMessage(LlmRole.USER, observationMsg))
 
-                // Also save to agent memory for cross-session recall
+                // SPEC_REF: LOOP-004 — persist observation to memory
                 agentMemory.store(
                     key = "task_${task.taskId}_step_$step",
                     value = "Tool=$toolName | Result=${toolResult.summary}"
                 )
             } else {
-                // LLM produced a thought with no tool call — add a prompt to continue
                 history.add(LlmMessage(LlmRole.USER, "Continue. If you have the answer, prefix it with '$FINAL_ANSWER_SIGNAL'"))
             }
         }
@@ -112,35 +123,36 @@ class ReActLoop @Inject constructor(
         return result
     }
 
-    // -----------------------------------------------------------------------
+    // -------------------------------------------------------------------------
     // Private helpers
-    // -----------------------------------------------------------------------
+    // -------------------------------------------------------------------------
 
     private fun buildSystemPrompt(node: AgentNode): String {
         val tools = toolRegistry.availableTools()
-            .joinToString("\n") { "  - ${it.name}: ${it.description}" }
+            .joinToString("\n") { " - ${it.name}: ${it.description}" }
 
         return """
             You are an autonomous AI agent running on an Android device named "${node.displayName}".
             You are part of a decentralized mesh network of AI agents.
-            
             Your job is to complete the user's task by reasoning step by step and calling tools when needed.
-            
+
             FORMAT YOUR RESPONSE:
             Thought: <your reasoning about what to do next>
             Action: <tool name>
             Action Input: <json input for the tool>
-            
+
             When you have the final answer, respond with:
             FINAL ANSWER: <your answer>
-            
+
             AVAILABLE TOOLS:
             $tools
-            
+
             CURRENT NODE CAPABILITIES: ${node.capabilities.joinToString(", ")}
             BATTERY LEVEL: ${node.batteryLevel}%
+
             OWNER PRESENT: ${node.isOwnerPresent}
-            
+            NOTE: If owner is not present, avoid irreversible actions unless pre-approved.
+
             Always be helpful, concise, and safe. Never perform irreversible actions without confirmation.
         """.trimIndent()
     }
@@ -150,33 +162,27 @@ class ReActLoop @Inject constructor(
             TASK: ${task.title}
             DESCRIPTION: ${task.description}
             PRIORITY: ${task.priority}
-            
+            ORIGIN: ${task.origin}
+            OWNER_APPROVED: ${task.ownerApproved}
+
             Begin your reasoning now.
         """.trimIndent()
 
-    /**
-     * Extract (toolName, toolInput) from LLM response.
-     * Expects format:
-     *   Action: tool_name
-     *   Action Input: {...}
-     */
     private fun parseToolCall(response: String): Pair<String, String>? {
         val actionLine = response.lines()
             .firstOrNull { it.trimStart().startsWith("Action:") }
             ?: return null
-
         val inputLine = response.lines()
             .firstOrNull { it.trimStart().startsWith("Action Input:") }
             ?: return null
-
         val toolName = actionLine.substringAfter("Action:").trim()
         val toolInput = inputLine.substringAfter("Action Input:").trim()
         return toolName to toolInput
     }
 
-    // -----------------------------------------------------------------------
-    // Loop state sealed class
-    // -----------------------------------------------------------------------
+    // -------------------------------------------------------------------------
+    // Loop state
+    // -------------------------------------------------------------------------
 
     sealed class LoopState {
         object Idle : LoopState()

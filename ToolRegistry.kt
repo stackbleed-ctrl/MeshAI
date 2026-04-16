@@ -1,6 +1,8 @@
 package com.meshai.tools
 
 import android.content.Context
+import com.meshai.agent.AgentNode
+import com.meshai.agent.AgentTask
 import com.meshai.tools.camera.CameraTool
 import com.meshai.tools.call.CallTool
 import com.meshai.tools.location.LocationTool
@@ -15,11 +17,15 @@ import javax.inject.Singleton
 /**
  * Central registry for all agent tools.
  *
- * Each tool implements [AgentTool] and is registered here.
- * The [ReActLoop] calls [executeTool] with a tool name and JSON input string.
+ * SPEC_REF: INV-005 / TOOL-001
+ * ALL tool execution MUST go through [executeTool]. Direct calls to
+ * [AgentTool.execute] outside this class are a spec violation.
  *
- * Tools gracefully degrade when permissions are missing — they return a
- * [ToolResult.failure] with a clear message rather than throwing.
+ * SPEC_REF: SAFETY-001
+ * [executeTool] routes every call through [ToolExecutionGuard], which calls
+ * [com.meshai.agent.safety.SafetyGate] before any tool is invoked.
+ *
+ * Protocol-Version: 1 (MESHAI_PROTO_V1)
  */
 @Singleton
 class ToolRegistry @Inject constructor(
@@ -28,7 +34,9 @@ class ToolRegistry @Inject constructor(
     private val callTool: CallTool,
     private val notificationTool: NotificationTool,
     private val cameraTool: CameraTool,
-    private val locationTool: LocationTool
+    private val locationTool: LocationTool,
+    // SPEC_REF: SAFETY-001 / INV-005 — guard is mandatory
+    private val executionGuard: ToolExecutionGuard
 ) {
 
     private val tools: Map<String, AgentTool> by lazy {
@@ -43,14 +51,26 @@ class ToolRegistry @Inject constructor(
         ).associateBy { it.name }
     }
 
-    /** Execute a tool by name with a JSON input string */
-    suspend fun executeTool(toolName: String, jsonInput: String): ToolResult {
+    /**
+     * Execute a tool by name with a JSON input string.
+     *
+     * SPEC_REF: SAFETY-001 / INV-005
+     * All calls are routed through [ToolExecutionGuard] → [SafetyGate].
+     * This is the ONLY valid path to tool execution.
+     */
+    suspend fun executeTool(
+        toolName: String,
+        jsonInput: String,
+        task: AgentTask,
+        node: AgentNode
+    ): ToolResult {
         val tool = tools[toolName]
             ?: return ToolResult.failure("Unknown tool: '$toolName'. Available: ${tools.keys.joinToString()}")
 
         return try {
-            Timber.d("[Tools] Executing: $toolName | input: $jsonInput")
-            val result = tool.execute(jsonInput)
+            Timber.d("[Tools] Routing to guard: $toolName | input: $jsonInput")
+            // SPEC_REF: SAFETY-001 — mandatory guard call, never skip
+            val result = executionGuard.execute(tool, jsonInput, task, node)
             Timber.d("[Tools] Result: ${result.summary}")
             result
         } catch (e: Exception) {
@@ -62,23 +82,34 @@ class ToolRegistry @Inject constructor(
     fun availableTools(): List<AgentTool> = tools.values.toList()
 }
 
-// -----------------------------------------------------------------------
+// -------------------------------------------------------------------------
 // Tool interface
-// -----------------------------------------------------------------------
+// -------------------------------------------------------------------------
 
 /**
  * Contract for all agent-callable tools.
+ *
+ * SPEC_REF: TOOL-002, TOOL-003, TOOL-004
  */
 interface AgentTool {
     val name: String
     val description: String
-    val inputSchema: String  // JSON Schema string for documentation/validation
+    val inputSchema: String
+
+    /**
+     * SPEC_REF: SAFETY-004
+     * Set to true for tools that make changes that cannot easily be undone
+     * (e.g. sending SMS, making calls). SafetyGate uses this to enforce
+     * owner-presence requirements.
+     */
+    val isIrreversible: Boolean get() = false
+
     suspend fun execute(jsonInput: String): ToolResult
 }
 
-// -----------------------------------------------------------------------
+// -------------------------------------------------------------------------
 // ToolResult
-// -----------------------------------------------------------------------
+// -------------------------------------------------------------------------
 
 data class ToolResult(
     val success: Boolean,
@@ -94,15 +125,16 @@ data class ToolResult(
     }
 }
 
-// -----------------------------------------------------------------------
+// -------------------------------------------------------------------------
 // Built-in utility tools
-// -----------------------------------------------------------------------
+// -------------------------------------------------------------------------
 
-/** Tool that pauses execution for a specified duration */
+/** Pauses execution for a specified duration */
 class WaitTool : AgentTool {
     override val name = "wait"
     override val description = "Wait for a specified number of seconds before continuing"
     override val inputSchema = """{"seconds": "number (1-60)"}"""
+    override val isIrreversible = false
 
     override suspend fun execute(jsonInput: String): ToolResult {
         return try {
@@ -120,11 +152,12 @@ class WaitTool : AgentTool {
     }
 }
 
-/** Tool that lets the agent record a reasoning step without calling an external service */
+/** Records a reasoning step without calling any external service */
 class ReasonTool : AgentTool {
     override val name = "reason"
     override val description = "Record a reasoning or planning step without calling any external service"
     override val inputSchema = """{"thought": "string"}"""
+    override val isIrreversible = false
 
     override suspend fun execute(jsonInput: String): ToolResult {
         return ToolResult.success("Reasoning recorded.")
