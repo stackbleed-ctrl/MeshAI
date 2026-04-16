@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Base application theme. Compose handles the full theme via MeshAITheme. -->
+    <style name="Theme.MeshAI" parent="android:Theme.Material.NoTitleBar">
+        <!-- Status bar / navigation bar color is set programmatically in Theme.kt -->
+        <item name="android:windowBackground">@android:color/black</item>
+        <item name="android:windowDrawsSystemBarBackgrounds">true</item>
+        <item name="android:windowTranslucentStatus">false</item>
+    </style>
+
+    <!-- Splash screen theme — shows while app is loading -->
+    <style name="Theme.MeshAI.Splash" parent="Theme.MeshAI">
+        <item name="android:windowBackground">@drawable/splash_background</item>
+    </style>
+</resources>

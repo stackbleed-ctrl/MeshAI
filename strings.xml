@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">MeshAI</string>
+    <string name="notification_listener_label">MeshAI Notification Access</string>
+    <string name="agent_mode_active">Agent Mode Active</string>
+    <string name="agent_mode_inactive">Owner Present</string>
+    <string name="mesh_connected">Mesh Connected</string>
+    <string name="mesh_searching">Searching for nodes…</string>
+    <string name="mesh_offline">Mesh Offline</string>
+    <string name="permission_rationale_location">MeshAI needs location access to discover nearby mesh nodes via Wi-Fi Direct.</string>
+    <string name="permission_rationale_bluetooth">MeshAI needs Bluetooth access to advertise and discover nearby AI agent nodes via BLE.</string>
+    <string name="permission_rationale_sms">MeshAI needs SMS access so your AI agent can send messages on your behalf when you\'re unavailable.</string>
+    <string name="permission_rationale_notifications">MeshAI needs notification access to read and respond to your notifications in Agent Mode.</string>
+    <string name="permission_rationale_camera">MeshAI needs camera access for monitoring tasks defined by you.</string>
+</resources>
