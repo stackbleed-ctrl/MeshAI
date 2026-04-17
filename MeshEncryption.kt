@@ -140,6 +140,19 @@ class MeshEncryption @Inject constructor() {
         peerSessionKeys.containsKey(peerNodeId)
 
     /**
+     * Returns the most recently used send counter for [peerNodeId].
+     *
+     * Call this immediately after [encrypt] to retrieve the counter value
+     * that was bound into the GCM AAD, so the transport layer can embed it
+     * in the wire frame header for the receiver's AAD reconstruction.
+     *
+     * Thread safety: safe to call after [encrypt] returns — the counter is
+     * incremented atomically inside [encrypt] before this method is called.
+     */
+    fun currentSendCounter(peerNodeId: String): Long =
+        peerSendCounters[peerNodeId] ?: 0L
+
+    /**
      * Evicts the session key for a peer (e.g., on disconnect or rotation).
      * The next message will require a new handshake.
      */
