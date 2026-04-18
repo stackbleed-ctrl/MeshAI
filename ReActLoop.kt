@@ -3,8 +3,10 @@ package com.meshai.agent
 import com.meshai.llm.LlmEngine
 import com.meshai.llm.LlmMessage
 import com.meshai.llm.LlmRole
+import com.meshai.tools.ToolOutputValidator
 import com.meshai.tools.ToolRegistry
 import com.meshai.tools.ToolResult
+import com.meshai.tools.ValidationResult
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -14,150 +16,207 @@ import javax.inject.Inject
 import javax.inject.Singleton
 
 /**
- * ReAct (Reasoning + Acting) agent loop.
+ * ReAct (Reasoning + Acting) agent loop — production-grade execution engine.
  *
- * The loop follows the pattern:
- * Thought → Action → Observation → Thought → ... → Final Answer
+ * Runs the Think → Act → Observe → Think cycle until the LLM signals a final
+ * answer, a budget ceiling is hit, or the step limit is reached. Returns both
+ * a result string and a structured [ExecutionTrace] for dashboard display and
+ * persistent storage alongside the completed [AgentTask].
  *
- * At each step:
- * 1. Build context (task description, memory, available tools, previous steps)
- * 2. Ask LLM to produce a Thought and an Action (tool call or final answer)
- * 3. Execute the action via [ToolRegistry]
- * 4. Record the Observation
- * 5. Repeat until the LLM signals a final answer or max steps reached
+ * ## Safeguards
  *
- * Thread safety: [execute] is protected by [executionMutex] — concurrent calls
- * from mesh-delegated tasks will queue rather than corrupt shared state.
- *
- * Context management: [pruneHistory] enforces a sliding window so the total
- * prompt never exceeds Gemma 2B's ~8k-token context ceiling.
+ * | Safeguard                | Mechanism                                          |
+ * |--------------------------|----------------------------------------------------|
+ * | Concurrent task safety   | [executionMutex] — non-reentrant singleton         |
+ * | Context window overflow  | [pruneHistory] — sliding window before each LLM call |
+ * | Multiline JSON parse     | [parseToolCall] collects all lines after Action Input: |
+ * | Garbage max-steps result | Clean error string from agentMemory, not raw LLM dump |
+ * | Budget exhaustion        | [ExecutionBudget] — hard token ceiling per run      |
+ * | Tool output garbage      | [ToolOutputValidator] — validates JSON before LLM ingestion |
+ * | Silent failures          | [ExecutionTrace] — structured per-step observability record |
  */
 @Singleton
 class ReActLoop @Inject constructor(
     private val llmEngine: LlmEngine,
     private val toolRegistry: ToolRegistry,
-    private val agentMemory: AgentMemory
+    private val agentMemory: AgentMemory,
+    private val toolOutputValidator: ToolOutputValidator
 ) {
 
     companion object {
         private const val MAX_STEPS = 12
         private const val FINAL_ANSWER_SIGNAL = "FINAL ANSWER:"
-
-        /**
-         * Approximate token budget for history before pruning.
-         * Leaves headroom for the system prompt (~600 tokens) and next
-         * LLM response (~1024 tokens) within an 8192-token context window.
-         */
-        private const val MAX_HISTORY_TOKENS = 3000
-
-        /**
-         * Number of recent history entries (assistant+user pairs) to
-         * preserve verbatim when pruning. Older entries are summarised.
-         */
+        private const val MAX_HISTORY_TOKENS = 3_000
         private const val PRESERVE_RECENT_PAIRS = 4
     }
 
-    // -----------------------------------------------------------------------
-    // Bug fix 1: execution mutex prevents concurrent tasks from
-    // overwriting _loopState on a shared singleton.
-    // -----------------------------------------------------------------------
     private val executionMutex = Mutex()
 
     private val _loopState = MutableStateFlow<LoopState>(LoopState.Idle)
     val loopState: StateFlow<LoopState> = _loopState
 
+    // -----------------------------------------------------------------------
+    // Public API
+    // -----------------------------------------------------------------------
+
     /**
-     * Run the ReAct loop for the given task.
-     * Returns the final natural-language answer/result.
+     * Run the ReAct loop for [task] on [localNode].
      *
-     * This function is non-reentrant: a second [execute] call will suspend
-     * until the first completes.
+     * @param budget  Token budget for this run. Default: [ExecutionBudget.DEFAULT_MAX_TOKENS].
+     *                Pass a tighter budget for LOW-priority tasks or a larger one for CRITICAL.
+     * @return        [ExecutionResult] — the answer string plus the full [ExecutionTrace].
      */
-    suspend fun execute(task: AgentTask, localNode: AgentNode): String {
-        // Bug fix 1: wrap entire execution in mutex
+    suspend fun execute(
+        task: AgentTask,
+        localNode: AgentNode,
+        budget: ExecutionBudget = ExecutionBudget()
+    ): ExecutionResult {
         executionMutex.withLock {
+            val startMs = System.currentTimeMillis()
             _loopState.value = LoopState.Running(task)
-            Timber.d("[ReAct] Starting task: ${task.title}")
+            Timber.d("[ReAct] Starting '${task.title}' (budget: ${budget.maxTokens} tokens)")
 
             val history = mutableListOf<LlmMessage>()
-            val systemPrompt = buildSystemPrompt(localNode)
+            val systemPrompt = buildSystemPrompt(localNode, budget)
+            val stepTraces = mutableListOf<StepTrace>()
 
-            // Initial user message: the task
             history.add(LlmMessage(LlmRole.USER, buildTaskPrompt(task)))
 
             var step = 0
             var finalAnswer: String? = null
+            var outcome = ExecutionTrace.Outcome.MAX_STEPS
 
             while (step < MAX_STEPS && finalAnswer == null) {
                 step++
-                Timber.d("[ReAct] Step $step/$MAX_STEPS")
+                val stepStart = System.currentTimeMillis()
 
-                // Bug fix 2: prune history before each LLM call to stay
-                // within the model's context window
+                // Abort before making another LLM call if budget is already gone
+                if (budget.isExhausted) {
+                    Timber.w("[ReAct] Budget exhausted before step $step — stopping")
+                    outcome = ExecutionTrace.Outcome.BUDGET_EXCEEDED
+                    stepTraces.add(
+                        StepTrace(
+                            stepNumber = step,
+                            type = StepTrace.StepType.BUDGET_STOP,
+                            llmResponseSnippet = "",
+                            tokensCost = 0,
+                            elapsedMs = 0
+                        )
+                    )
+                    break
+                }
+
+                Timber.d("[ReAct] Step $step/$MAX_STEPS — budget remaining: ${budget.remaining}")
                 pruneHistory(history)
+
+                // Build a billing proxy of the full prompt for token estimation
+                val promptForBilling = systemPrompt + history.joinToString("") { it.content }
 
                 val llmResponse = llmEngine.complete(
                     systemPrompt = systemPrompt,
                     messages = history
                 )
 
-                Timber.d("[ReAct] LLM response: $llmResponse")
+                val stepTokens = budget.charge(promptForBilling, llmResponse)
+                Timber.d("[ReAct] LLM response: ${llmResponse.take(120)}")
 
-                // Record assistant turn
                 history.add(LlmMessage(LlmRole.ASSISTANT, llmResponse))
 
-                // Check for final answer signal
+                // ---- Final answer? ----
                 if (llmResponse.contains(FINAL_ANSWER_SIGNAL)) {
-                    finalAnswer = llmResponse
-                        .substringAfter(FINAL_ANSWER_SIGNAL)
-                        .trim()
+                    finalAnswer = llmResponse.substringAfter(FINAL_ANSWER_SIGNAL).trim()
+                    outcome = ExecutionTrace.Outcome.SUCCESS
+                    stepTraces.add(
+                        StepTrace(
+                            stepNumber = step,
+                            type = StepTrace.StepType.FINAL_ANSWER,
+                            llmResponseSnippet = llmResponse.take(200),
+                            tokensCost = stepTokens,
+                            elapsedMs = System.currentTimeMillis() - stepStart
+                        )
+                    )
                     break
                 }
 
-                // Bug fix 3: parse tool call with multiline Action Input support
+                // ---- Tool call? ----
                 val toolCall = parseToolCall(llmResponse)
                 if (toolCall != null) {
                     val (toolName, toolInput) = toolCall
-                    Timber.d("[ReAct] Calling tool: $toolName with input: $toolInput")
+                    Timber.d("[ReAct] Tool: $toolName | input: ${toolInput.take(80)}")
 
                     val toolResult: ToolResult = try {
                         toolRegistry.executeTool(toolName, toolInput)
                     } catch (e: Exception) {
-                        Timber.e(e, "[ReAct] Tool execution failed")
+                        Timber.e(e, "[ReAct] Tool threw: ${e.message}")
                         ToolResult.failure("Tool error: ${e.message}")
                     }
 
-                    val observationMsg = "Observation: ${toolResult.summary}"
-                    history.add(LlmMessage(LlmRole.USER, observationMsg))
+                    // Validate tool output before the LLM sees it
+                    val spec = toolRegistry.outputSpec(toolName)
+                    val validation = toolOutputValidator.validate(toolName, toolResult.summary, spec)
+
+                    val observationText = when (validation) {
+                        is ValidationResult.Ok      -> "Observation: ${validation.sanitized}"
+                        is ValidationResult.Invalid -> {
+                            Timber.w("[ReAct] $toolName output invalid: ${validation.reason}")
+                            "Observation: ${validation.sanitized}"
+                        }
+                    }
+
+                    history.add(LlmMessage(LlmRole.USER, observationText))
+
+                    val toolTokens = budget.chargeTool(toolInput, toolResult.summary)
 
                     agentMemory.store(
                         key = "task_${task.taskId}_step_$step",
-                        value = "Tool=$toolName | Result=${toolResult.summary}"
+                        value = "Tool=$toolName | Result=${toolResult.summary.take(200)}"
+                    )
+
+                    stepTraces.add(
+                        StepTrace(
+                            stepNumber = step,
+                            type = StepTrace.StepType.TOOL_CALL,
+                            llmResponseSnippet = llmResponse.take(200),
+                            toolName = toolName,
+                            toolInputSnippet = toolInput.take(100),
+                            toolResultSnippet = toolResult.summary.take(100),
+                            tokensCost = stepTokens + toolTokens,
+                            elapsedMs = System.currentTimeMillis() - stepStart,
+                            validationError = (validation as? ValidationResult.Invalid)?.reason
+                        )
                     )
                 } else {
+                    // LLM produced a thought with no recognisable tool call
                     history.add(
                         LlmMessage(
                             LlmRole.USER,
                             "Continue. If you have the answer, prefix it with '$FINAL_ANSWER_SIGNAL'"
                         )
                     )
+                    stepTraces.add(
+                        StepTrace(
+                            stepNumber = step,
+                            type = StepTrace.StepType.THOUGHT_ONLY,
+                            llmResponseSnippet = llmResponse.take(200),
+                            tokensCost = stepTokens,
+                            elapsedMs = System.currentTimeMillis() - stepStart
+                        )
+                    )
                 }
             }
 
-            // Bug fix 4: never leak raw LLM reasoning as the task result.
-            // Return a structured failure string so upstream code and the
-            // owner notification see something meaningful.
+            // ---- Finalise ----
             val result = finalAnswer ?: run {
-                Timber.w("[ReAct] Max steps hit for task ${task.taskId} ('${task.title}')")
-                _loopState.value = LoopState.Error(task, "Max reasoning steps exceeded")
+                if (outcome != ExecutionTrace.Outcome.BUDGET_EXCEEDED) {
+                    outcome = ExecutionTrace.Outcome.MAX_STEPS
+                }
+                Timber.w("[ReAct] '${task.title}' stopped: $outcome after $step steps")
+                _loopState.value = LoopState.Error(task, outcome.name)
                 val lastMemory = agentMemory.recall("task_${task.taskId}_step_$step")?.value
                 buildString {
-                    append("Agent could not complete '${task.title}' within the reasoning limit ($MAX_STEPS steps). ")
-                    if (lastMemory != null) {
-                        append("Last recorded action: $lastMemory")
-                    } else {
-                        append("No tool actions were recorded.")
-                    }
+                    append("Agent could not complete '${task.title}' ($outcome, $step steps). ")
+                    if (lastMemory != null) append("Last action: $lastMemory")
+                    else append("No tool actions recorded.")
                 }
             }
 
@@ -165,33 +224,32 @@ class ReActLoop @Inject constructor(
                 _loopState.value = LoopState.Completed(task, result)
             }
 
-            Timber.i("[ReAct] Task '${task.title}' completed: $result")
-            return result
+            val trace = ExecutionTrace(
+                taskId         = task.taskId,
+                taskTitle      = task.title,
+                steps          = stepTraces,
+                finalResult    = result,
+                outcome        = outcome,
+                budget         = budget.snapshot(),
+                totalElapsedMs = System.currentTimeMillis() - startMs
+            )
+
+            Timber.i("[ReAct] ${trace.summary()}")
+            return ExecutionResult(answer = result, trace = trace)
         }
     }
 
     // -----------------------------------------------------------------------
-    // Bug fix 2: sliding-window history pruning
+    // Sliding-window history pruning
     // -----------------------------------------------------------------------
 
-    /**
-     * Prunes [history] to keep the estimated token count below [MAX_HISTORY_TOKENS].
-     *
-     * Strategy:
-     * - Always keep the first message (original task prompt).
-     * - Always keep the last [PRESERVE_RECENT_PAIRS] * 2 messages verbatim.
-     * - Replace everything in between with a one-line summary.
-     *
-     * Token estimation: ~4 chars per token (conservative for English + JSON).
-     */
     private fun pruneHistory(history: MutableList<LlmMessage>) {
         val estimatedTokens = history.sumOf { it.content.length / 4 }
         if (estimatedTokens <= MAX_HISTORY_TOKENS) return
 
-        val keepCount = PRESERVE_RECENT_PAIRS * 2 // assistant + user pairs
-        if (history.size <= keepCount + 1) return  // not enough entries to prune
+        val keepCount = PRESERVE_RECENT_PAIRS * 2
+        if (history.size <= keepCount + 1) return
 
-        // Entries to summarise: everything except the first and last keepCount
         val toSummarise = history.subList(1, history.size - keepCount)
         val summary = buildString {
             append("Summary of previous steps: ")
@@ -201,107 +259,70 @@ class ReActLoop @Inject constructor(
                 if (idx < toSummarise.lastIndex) append("; ")
             }
         }
-
-        // Remove the middle section and replace with summary
         toSummarise.clear()
         history.add(1, LlmMessage(LlmRole.USER, summary))
-
-        Timber.d("[ReAct] History pruned — estimated tokens now ~${history.sumOf { it.content.length / 4 }}")
+        Timber.d("[ReAct] History pruned — ~${history.sumOf { it.content.length / 4 }} tokens")
     }
 
     // -----------------------------------------------------------------------
-    // Private helpers
+    // Prompt builders
     // -----------------------------------------------------------------------
 
-    private fun buildSystemPrompt(node: AgentNode): String {
+    private fun buildSystemPrompt(node: AgentNode, budget: ExecutionBudget): String {
         val tools = toolRegistry.availableTools()
             .joinToString("\n") { "  - ${it.name}: ${it.description}" }
-
         return """
-You are an autonomous AI agent running on an Android device named "${node.displayName}".
-You are part of a decentralized mesh network of AI agents.
-Your job is to complete the user's task by reasoning step by step and calling tools when needed.
+You are an autonomous AI agent on Android device "${node.displayName}" in a decentralized mesh network.
+Complete the user's task by reasoning step by step and calling tools when needed.
 
 FORMAT YOUR RESPONSE EXACTLY AS:
 
-Thought: <your reasoning about what to do next>
+Thought: <your reasoning>
 Action: <tool name>
-Action Input: <json input for the tool — may span multiple lines>
+Action Input: <json — may span multiple lines>
 
-When you have the final answer, respond with:
+When you have the final answer:
 FINAL ANSWER: <your answer>
 
 AVAILABLE TOOLS:
 $tools
 
-CURRENT NODE CAPABILITIES: ${node.capabilities.joinToString(", ")}
-BATTERY LEVEL: ${node.batteryLevel}%
-OWNER PRESENT: ${node.isOwnerPresent}
-
-Always be helpful, concise, and safe. Never perform irreversible actions without confirmation.
+NODE: capabilities=${node.capabilities.joinToString()}, battery=${node.batteryLevel}%, ownerPresent=${node.isOwnerPresent}
+BUDGET: ${budget.remaining} tokens remaining — be concise.
         """.trimIndent()
     }
 
     private fun buildTaskPrompt(task: AgentTask): String =
-        """
-TASK: ${task.title}
-DESCRIPTION: ${task.description}
-PRIORITY: ${task.priority}
-
-Begin your reasoning now.
-        """.trimIndent()
+        "TASK: ${task.title}\nDESCRIPTION: ${task.description}\nPRIORITY: ${task.priority}\n\nBegin reasoning."
 
     // -----------------------------------------------------------------------
-    // Bug fix 3: multiline Action Input parser
+    // Multiline Action Input parser
     // -----------------------------------------------------------------------
 
-    /**
-     * Extract (toolName, rawJsonInput) from an LLM response.
-     *
-     * Handles the common Gemma output pattern where Action Input JSON
-     * spans multiple lines:
-     *
-     *   Action: send_sms
-     *   Action Input: {
-     *     "to": "+1234",
-     *     "message": "hello"
-     *   }
-     *
-     * The original single-line approach returned only `{` in this case,
-     * causing silent downstream JSON parse failures.
-     */
     private fun parseToolCall(response: String): Pair<String, String>? {
         val lines = response.lines()
-
         val actionIdx = lines.indexOfFirst { it.trimStart().startsWith("Action:") }
         val inputIdx  = lines.indexOfFirst { it.trimStart().startsWith("Action Input:") }
-
         if (actionIdx < 0 || inputIdx < 0) return null
 
         val toolName = lines[actionIdx].substringAfter("Action:").trim()
         if (toolName.isBlank()) return null
 
-        // Collect all lines from inputIdx onward, stopping at the next
-        // structural keyword or end of string.
-        val jsonLines = lines
-            .drop(inputIdx)
+        val jsonLines = lines.drop(inputIdx)
             .mapIndexed { i, line ->
                 if (i == 0) line.substringAfter("Action Input:").trim() else line
             }
             .takeWhile { line ->
-                val trimmed = line.trimStart()
-                !trimmed.startsWith("Thought:") &&
-                !trimmed.startsWith("Action:") &&
-                !trimmed.startsWith(FINAL_ANSWER_SIGNAL)
+                val t = line.trimStart()
+                !t.startsWith("Thought:") && !t.startsWith("Action:") && !t.startsWith(FINAL_ANSWER_SIGNAL)
             }
 
         val rawJson = jsonLines.joinToString("\n").trim()
-
         return if (rawJson.isNotBlank()) toolName to rawJson else null
     }
 
     // -----------------------------------------------------------------------
-    // Loop state sealed class
+    // State
     // -----------------------------------------------------------------------
 
     sealed class LoopState {
@@ -311,3 +332,14 @@ Begin your reasoning now.
         data class Error(val task: AgentTask, val error: String) : LoopState()
     }
 }
+
+/**
+ * Return value of [ReActLoop.execute].
+ *
+ * [answer] is passed to [AgentRepository.completeTask].
+ * [trace] is stored alongside the task for dashboard display and debugging.
+ */
+data class ExecutionResult(
+    val answer: String,
+    val trace: ExecutionTrace
+)

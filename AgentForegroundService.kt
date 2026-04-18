@@ -15,9 +15,11 @@ import com.meshai.R
 import com.meshai.agent.AgentMemory
 import com.meshai.agent.AgentNode
 import com.meshai.agent.AgentTask
+import com.meshai.agent.ExecutionBudget
 import com.meshai.agent.GoalEngine
 import com.meshai.agent.OwnerPresenceDetector
 import com.meshai.agent.ReActLoop
+import com.meshai.agent.TaskPriority
 import com.meshai.agent.TaskStatus
 import com.meshai.data.repository.AgentRepository
 import com.meshai.mesh.MeshNetwork
@@ -37,47 +39,37 @@ import timber.log.Timber
 import javax.inject.Inject
 
 /**
- * Persistent Foreground Service that keeps the MeshAI agent running 24/7.
- *
- * Responsibilities:
- * 1. Initialize and start the mesh network
- * 2. Run the ReAct agent loop for queued tasks
- * 3. Monitor owner presence and switch to Agent Mode when away
- * 4. Handle mesh message routing (delegate tasks, sync memory)
- * 5. Manage the persistent foreground notification
- *
- * The service is started at boot via [BootReceiver] and re-started by
- * WorkManager if killed by the system.
+ * Persistent Foreground Service — keeps the MeshAI agent running 24/7.
  *
  * ## Bug fixes applied
  *
- * Fix 1 — Idempotent [initializeAgent]:
- * The service uses START_STICKY, so the OS can restart it after being killed.
- * Previously [initializeAgent] spawned a new [agentLoopJob] without cancelling
- * the old one, resulting in multiple concurrent loops pulling tasks from the
- * same Room queue after 3+ OS restarts. Now [agentLoopJob] is cancelled before
- * any new launch.
+ * 1. **Idempotent init** — `agentLoopJob?.cancel()` before re-launch prevents
+ *    multiple concurrent loops after OS-triggered START_STICKY restarts.
  *
- * Fix 2 — Mutex'd wake lock via [withWakeLock]:
- * The original [acquireWakeLock] overwrote the [wakeLock] reference without
- * releasing the previous lock if called concurrently (e.g., two tasks queued).
- * Each orphaned lock held for up to 5 minutes. [withWakeLock] serialises lock
- * acquisition and always releases via try/finally.
+ * 2. **Mutex'd wake lock** — `withWakeLock { }` serialises lock acquisition
+ *    and always releases via try/finally, preventing orphaned 5-min locks.
  *
- * Fix 3 — Receiver on main thread:
- * [registerReceiver] must be called from the main thread. The original code
- * called it inside a [serviceScope] coroutine dispatched on [Dispatchers.Default]
- * (thread pool). On several OEMs this silently failed, leaving owner presence
- * undetected. The call is now made directly from [onStartCommand] on the main
- * thread before the coroutine is launched.
+ * 3. **Receiver on main thread** — `registerScreenReceiver()` called from
+ *    `onStartCommand()` (main thread), not inside a coroutine.
+ *
+ * ## Production additions
+ *
+ * 4. **Priority-based budgets** — CRITICAL tasks get 2× the default token
+ *    budget; LOW tasks get half. Budget is passed into `ReActLoop.execute()`.
+ *
+ * 5. **ExecutionTrace storage** — The [ExecutionTrace] returned by the loop
+ *    is forwarded to [AgentRepository.storeTrace] for dashboard display.
+ *
+ * 6. **Lease management** — [TaskLeaseManager] is called before and after
+ *    each task to prevent duplicate execution across the mesh.
  */
 @AndroidEntryPoint
 class AgentForegroundService : Service() {
 
     companion object {
-        private const val NOTIFICATION_ID = 1001
-        private const val CHANNEL_ID      = "meshai_agent"
-        private const val CHANNEL_NAME    = "MeshAI Agent"
+        private const val NOTIFICATION_ID     = 1001
+        private const val CHANNEL_ID          = "meshai_agent"
+        private const val CHANNEL_NAME        = "MeshAI Agent"
 
         const val ACTION_START              = "com.meshai.START_AGENT"
         const val ACTION_STOP               = "com.meshai.STOP_AGENT"
@@ -87,6 +79,14 @@ class AgentForegroundService : Service() {
             Intent(context, AgentForegroundService::class.java).apply {
                 action = ACTION_START
             }
+
+        /** Token budget multipliers by task priority. */
+        private val BUDGET_BY_PRIORITY = mapOf(
+            TaskPriority.LOW      to (ExecutionBudget.DEFAULT_MAX_TOKENS / 2),
+            TaskPriority.NORMAL   to ExecutionBudget.DEFAULT_MAX_TOKENS,
+            TaskPriority.HIGH     to (ExecutionBudget.DEFAULT_MAX_TOKENS * 3 / 2),
+            TaskPriority.CRITICAL to (ExecutionBudget.DEFAULT_MAX_TOKENS * 2)
+        )
     }
 
     @Inject lateinit var meshNetwork: MeshNetwork
@@ -95,15 +95,11 @@ class AgentForegroundService : Service() {
     @Inject lateinit var ownerPresenceDetector: OwnerPresenceDetector
     @Inject lateinit var agentRepository: AgentRepository
     @Inject lateinit var goalEngine: GoalEngine
+    @Inject lateinit var taskLeaseManager: TaskLeaseManager
 
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
-
-    // Bug fix 1: tracked so we can cancel before re-launching
     private var agentLoopJob: Job? = null
-
-    // Bug fix 2: mutex ensures only one wakelock is held at a time
     private val wakeLockMutex = Mutex()
-
     private lateinit var localNode: AgentNode
     private var screenStateReceiver: ScreenStateReceiver? = null
 
@@ -133,14 +129,10 @@ class AgentForegroundService : Service() {
 
         startForeground(NOTIFICATION_ID, buildNotification("Agent initializing..."))
 
-        // Bug fix 3: registerReceiver MUST run on the main thread.
-        // onStartCommand is called on the main thread, so register here
-        // before launching any coroutine.
+        // Fix 3: registerReceiver must run on the main thread (here in onStartCommand)
         registerScreenReceiver()
 
-        // Launch agent init on background dispatcher
         serviceScope.launch { initializeAgent() }
-
         return START_STICKY
     }
 
@@ -160,24 +152,19 @@ class AgentForegroundService : Service() {
     // -----------------------------------------------------------------------
 
     /**
-     * Idempotent agent initialization.
-     *
-     * Safe to call multiple times (e.g., on START_STICKY restarts).
-     * Always cancels any existing [agentLoopJob] before starting a new one,
-     * preventing duplicate concurrent loops after OS-triggered restarts.
+     * Idempotent — safe to call on every START_STICKY restart.
+     * Cancels any existing loop before creating a replacement.
      */
     private suspend fun initializeAgent() {
-        // Bug fix 1: cancel existing loop job before creating a new one
+        // Fix 1: cancel before re-launch
         agentLoopJob?.cancel()
         agentLoopJob = null
 
         localNode = agentRepository.getOrCreateLocalNode()
         Timber.i("[Service] Local node: ${localNode.displayName} (${localNode.nodeId})")
 
-        // Start mesh networking
         meshNetwork.start(localNode)
 
-        // Observe presence changes and update notification
         serviceScope.launch {
             ownerPresenceDetector.isOwnerPresent.collectLatest { present ->
                 updateNotification(
@@ -188,14 +175,11 @@ class AgentForegroundService : Service() {
             }
         }
 
-        // Start the main task loop
         startAgentLoop()
     }
 
-    // Bug fix 3: called from onStartCommand (main thread), not from coroutine
     private fun registerScreenReceiver() {
-        if (screenStateReceiver != null) return  // already registered (idempotent guard)
-
+        if (screenStateReceiver != null) return
         screenStateReceiver = ScreenStateReceiver(
             onScreenOff = { serviceScope.launch { ownerPresenceDetector.onScreenOff() } },
             onScreenOn  = { serviceScope.launch { ownerPresenceDetector.onScreenOn() } }
@@ -212,11 +196,9 @@ class AgentForegroundService : Service() {
     // -----------------------------------------------------------------------
 
     private fun startAgentLoop() {
-        // Bug fix 1: assign to agentLoopJob so subsequent initializeAgent()
-        // calls can cancel this before launching a replacement.
         agentLoopJob = serviceScope.launch {
-            var backoffMs     = 5_000L
-            val maxBackoffMs  = 60_000L
+            var backoffMs    = 5_000L
+            val maxBackoffMs = 60_000L
 
             while (true) {
                 val pendingTasks = agentRepository.getPendingTasks()
@@ -229,19 +211,38 @@ class AgentForegroundService : Service() {
 
                 backoffMs = 5_000L
                 val task = pendingTasks.first()
-                Timber.d("[Service] Processing task: ${task.title}")
 
-                // Bug fix 2: serialised wakelock — only one held at a time,
-                // always released even on exception
+                // Distributed deduplication — skip if another node claimed it
+                if (!taskLeaseManager.claimTask(task.taskId, localNode.nodeId)) {
+                    Timber.d("[Service] Task ${task.taskId} already claimed — skipping")
+                    delay(2_000L)
+                    continue
+                }
+
+                Timber.d("[Service] Processing task: ${task.title} [${task.priority}]")
+
+                // Fix 2: mutex'd wakelock — one lock at a time, always released
                 withWakeLock {
                     try {
                         agentRepository.updateTaskStatus(task.taskId, TaskStatus.IN_PROGRESS)
-                        val result = reActLoop.execute(task, localNode)
-                        agentRepository.completeTask(task.taskId, result)
-                        Timber.i("[Service] Task completed: ${task.title}")
+
+                        val budget = ExecutionBudget(
+                            maxTokens = BUDGET_BY_PRIORITY[task.priority]
+                                ?: ExecutionBudget.DEFAULT_MAX_TOKENS
+                        )
+
+                        val execResult = reActLoop.execute(task, localNode, budget)
+
+                        // Store trace for dashboard / debugging
+                        agentRepository.storeTrace(task.taskId, execResult.trace)
+                        agentRepository.completeTask(task.taskId, execResult.answer)
+
+                        Timber.i("[Service] Task done: ${task.title} — ${execResult.trace.summary()}")
                     } catch (e: Exception) {
                         Timber.e(e, "[Service] Task failed: ${task.title}")
                         agentRepository.updateTaskStatus(task.taskId, TaskStatus.FAILED)
+                    } finally {
+                        taskLeaseManager.releaseTask(task.taskId, localNode.nodeId)
                     }
                 }
 
@@ -251,17 +252,9 @@ class AgentForegroundService : Service() {
     }
 
     // -----------------------------------------------------------------------
-    // Bug fix 2: mutex-guarded wakelock — replaces acquireWakeLock /
-    // releaseWakeLock which could orphan locks if called concurrently.
+    // Fix 2: mutex-guarded wake lock
     // -----------------------------------------------------------------------
 
-    /**
-     * Acquires a partial wake lock, executes [block], then unconditionally
-     * releases the lock — even if [block] throws. Serialised via [wakeLockMutex]
-     * so only one lock can be live at a time regardless of concurrency.
-     *
-     * Max hold time is 5 minutes as a safety ceiling.
-     */
     private suspend fun withWakeLock(block: suspend () -> Unit) {
         wakeLockMutex.withLock {
             val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
@@ -269,12 +262,8 @@ class AgentForegroundService : Service() {
                 PowerManager.PARTIAL_WAKE_LOCK,
                 "MeshAI:AgentTaskWakeLock"
             )
-            wl.acquire(5 * 60 * 1000L)  // safety ceiling — released in finally
-            try {
-                block()
-            } finally {
-                if (wl.isHeld) wl.release()
-            }
+            wl.acquire(5 * 60 * 1000L)
+            try { block() } finally { if (wl.isHeld) wl.release() }
         }
     }
 
@@ -284,9 +273,7 @@ class AgentForegroundService : Service() {
 
     private fun createNotificationChannel() {
         val channel = NotificationChannel(
-            CHANNEL_ID,
-            CHANNEL_NAME,
-            NotificationManager.IMPORTANCE_LOW
+            CHANNEL_ID, CHANNEL_NAME, NotificationManager.IMPORTANCE_LOW
         ).apply {
             description = "MeshAI autonomous agent status"
             setShowBadge(false)
@@ -296,8 +283,7 @@ class AgentForegroundService : Service() {
 
     private fun buildNotification(status: String): Notification {
         val tapIntent = PendingIntent.getActivity(
-            this, 0,
-            Intent(this, MainActivity::class.java),
+            this, 0, Intent(this, MainActivity::class.java),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
         val stopIntent = PendingIntent.getService(
