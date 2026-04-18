@@ -1,22 +1,18 @@
-package com.meshai.runtime
+package com.meshai.agent
 
+import org.json.JSONArray
+import org.json.JSONException
+import org.json.JSONObject
 import timber.log.Timber
 
-// ============================================================================
+// ═══════════════════════════════════════════════════════════════════════════
 // ExecutionBudget
-// ============================================================================
+// ═══════════════════════════════════════════════════════════════════════════
 
 /**
  * Per-run token ceiling with priority scaling.
- *
- * Tracks estimated token cost across a single [ReActLoop] run and enforces
- * a hard ceiling so runaway tasks don't burn 12 full LLM calls.
- *
- * Token counts are estimated at ~4 chars/token (standard English approximation).
- * Not exact, but consistent — correctness requires hitting the ceiling *before*
- * context overflow, not perfect accounting.
- *
- * SPEC_REF: EXEC-002 / OPTION-B
+ * Token counts estimated at ~4 chars/token. Not exact — correct enough to
+ * catch runaway tasks before context overflow, which is all that matters.
  */
 class ExecutionBudget(val maxTokens: Int = DEFAULT_MAX_TOKENS) {
 
@@ -27,14 +23,14 @@ class ExecutionBudget(val maxTokens: Int = DEFAULT_MAX_TOKENS) {
 
     private var tokensSpent: Int = 0
 
-    val remaining: Int          get() = (maxTokens - tokensSpent).coerceAtLeast(0)
-    val isExhausted: Boolean    get() = tokensSpent >= maxTokens
-    val fractionUsed: Float     get() = tokensSpent.toFloat() / maxTokens
+    val remaining: Int       get() = (maxTokens - tokensSpent).coerceAtLeast(0)
+    val isExhausted: Boolean get() = tokensSpent >= maxTokens
+    val fractionUsed: Float  get() = tokensSpent.toFloat() / maxTokens
 
     fun charge(promptText: String, responseText: String): Int {
         val cost = estimate(promptText) + estimate(responseText)
         tokensSpent += cost
-        Timber.d("[Budget] +$cost tokens (total $tokensSpent/$maxTokens)")
+        Timber.d("[Budget] +$cost tokens ($tokensSpent/$maxTokens)")
         return cost
     }
 
@@ -56,18 +52,13 @@ data class BudgetSnapshot(
     val fractionUsed: Float
 )
 
-// ============================================================================
-// ExecutionTrace
-// ============================================================================
+// ═══════════════════════════════════════════════════════════════════════════
+// ExecutionTrace + StepTrace
+// ═══════════════════════════════════════════════════════════════════════════
 
 /**
- * Structured record of a complete [ReActLoop] run.
- *
- * Stored alongside the [AgentTask] in Room and exposed to the dashboard
- * for per-task debugging: which tools were called, where budget went,
- * which step produced a validation error, total wall time.
- *
- * SPEC_REF: EXEC-003 / OPTION-B
+ * Structured record of a complete ReActLoop run.
+ * Stored alongside the AgentTask in Room and surfaced in the dashboard.
  */
 data class ExecutionTrace(
     val taskId: String,
@@ -78,24 +69,13 @@ data class ExecutionTrace(
     val budget: BudgetSnapshot,
     val totalElapsedMs: Long
 ) {
-    enum class Outcome {
-        SUCCESS,
-        BUDGET_EXCEEDED,
-        MAX_STEPS,
-        ERROR
-    }
+    enum class Outcome { SUCCESS, BUDGET_EXCEEDED, MAX_STEPS, ERROR }
 
     val stepCount: Int get() = steps.size
 
-    fun summary(): String = buildString {
-        append("'$taskTitle': ${outcome.name} ")
-        append("| ${stepCount} steps | ${budget.tokensSpent} tokens | ${totalElapsedMs}ms")
-    }
+    fun summary(): String = "'$taskTitle': ${outcome.name} | ${stepCount} steps | ${budget.tokensSpent} tokens | ${totalElapsedMs}ms"
 }
 
-/**
- * Record of a single ReAct iteration.
- */
 data class StepTrace(
     val stepNumber: Int,
     val type: StepType,
@@ -107,44 +87,25 @@ data class StepTrace(
     val elapsedMs: Long,
     val validationError: String?   = null
 ) {
-    enum class StepType {
-        TOOL_CALL,
-        THOUGHT_ONLY,
-        FINAL_ANSWER,
-        BUDGET_STOP,
-        PARSE_ERROR
-    }
+    enum class StepType { TOOL_CALL, THOUGHT_ONLY, FINAL_ANSWER, BUDGET_STOP, PARSE_ERROR }
 }
 
-/**
- * Return value of [ReActLoop.execute].
- * [answer] goes to [AgentRepository.completeTask].
- * [trace] goes to [AgentRepository.storeTrace] and the dashboard.
- */
-data class ExecutionResult(
-    val answer: String,
-    val trace: ExecutionTrace
-)
+/** Return value of ReActLoop.execute. */
+data class ExecutionResult(val answer: String, val trace: ExecutionTrace)
 
-// ============================================================================
+// ═══════════════════════════════════════════════════════════════════════════
 // ToolOutputValidator
-// ============================================================================
+// ═══════════════════════════════════════════════════════════════════════════
 
 /**
- * Validates and sanitises tool output before it enters the LLM context.
- *
- * If a tool returns malformed JSON, the LLM reasons over garbage and produces
- * confident-looking nonsense. This validator intercepts that and replaces bad
- * output with a structured `[Tool output error]` observation that the LLM can
- * reason about correctly.
- *
- * SPEC_REF: EXEC-004 / OPTION-B
+ * Validates tool output before it enters the LLM context.
+ * Malformed JSON → structured error observation the LLM can reason about.
  */
 class ToolOutputValidator {
 
     companion object {
         private const val MAX_OUTPUT_CHARS = 3_000
-        private const val INVALID_PREFIX = "[Tool output error]"
+        private const val INVALID_PREFIX   = "[Tool output error]"
     }
 
     fun validate(
@@ -153,14 +114,12 @@ class ToolOutputValidator {
         requiredFields: List<String> = emptyList()
     ): ValidationResult {
         if (rawOutput.isBlank()) {
-            return ValidationResult.Invalid(
-                reason    = "Empty output",
-                sanitized = "$INVALID_PREFIX Tool '$toolName' returned no output."
-            )
+            return ValidationResult.Invalid("Empty output",
+                "$INVALID_PREFIX Tool '$toolName' returned no output.")
         }
 
         val truncated = if (rawOutput.length > MAX_OUTPUT_CHARS) {
-            Timber.w("[Validator] $toolName output truncated (${rawOutput.length} chars)")
+            Timber.w("[Validator] $toolName output truncated")
             rawOutput.take(MAX_OUTPUT_CHARS) + "\n[...truncated]"
         } else rawOutput
 
@@ -168,18 +127,14 @@ class ToolOutputValidator {
         if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
             val jsonError = tryParseJson(trimmed)
             if (jsonError != null) {
-                return ValidationResult.Invalid(
-                    reason    = "Malformed JSON: $jsonError",
-                    sanitized = "$INVALID_PREFIX Tool '$toolName' returned malformed JSON. Snippet: ${trimmed.take(80)}"
-                )
+                return ValidationResult.Invalid("Malformed JSON: $jsonError",
+                    "$INVALID_PREFIX Tool '$toolName' returned malformed JSON. Snippet: ${trimmed.take(80)}")
             }
             if (requiredFields.isNotEmpty() && trimmed.startsWith("{")) {
                 val missing = checkRequired(trimmed, requiredFields)
                 if (missing.isNotEmpty()) {
-                    return ValidationResult.Invalid(
-                        reason    = "Missing fields: $missing",
-                        sanitized = "$INVALID_PREFIX Tool '$toolName' output missing: ${missing.joinToString()}."
-                    )
+                    return ValidationResult.Invalid("Missing fields: $missing",
+                        "$INVALID_PREFIX Tool '$toolName' missing: ${missing.joinToString()}.")
                 }
             }
         }
@@ -187,14 +142,11 @@ class ToolOutputValidator {
     }
 
     private fun tryParseJson(json: String): String? = runCatching {
-        if (json.startsWith("{")) org.json.JSONObject(json)
-        else org.json.JSONArray(json)
-        null
+        if (json.startsWith("{")) JSONObject(json) else JSONArray(json); null
     }.getOrElse { it.message?.take(100) }
 
     private fun checkRequired(json: String, required: List<String>): List<String> = runCatching {
-        val obj = org.json.JSONObject(json)
-        required.filter { !obj.has(it) }
+        val obj = JSONObject(json); required.filter { !obj.has(it) }
     }.getOrDefault(required)
 }
 

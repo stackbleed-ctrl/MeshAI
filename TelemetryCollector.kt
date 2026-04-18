@@ -1,7 +1,6 @@
-package com.meshai.runtime
+package com.meshai.agent
 
-import com.meshai.core.protocol.MeshEvent
-import com.meshai.storage.AgentRepository
+import com.meshai.data.repository.AgentRepository
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -14,16 +13,11 @@ import javax.inject.Inject
 import javax.inject.Singleton
 
 /**
- * TelemetryCollector — wires the control plane to persistent storage.
+ * TelemetryCollector — wires the control plane to live observability.
  *
- * Every MeshEvent is:
- *  1. Broadcast on [events] SharedFlow for live dashboard updates.
- *  2. Persisted to storage via AgentRepository.
- *
- * This unlocks:
- *  - Live sparklines in the dashboard.
- *  - Post-hoc cost/latency analysis.
- *  - PolicyEngine adaptive rules (future).
+ * Every task execution result flows through here. DecisionEngine reads
+ * stats() to make adaptive decisions (circuit breaker, cost throttle).
+ * DashboardViewModel collects events for live sparklines.
  *
  * SPEC_REF: TEL-001
  */
@@ -33,40 +27,58 @@ class TelemetryCollector @Inject constructor(
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
-    private val _events = MutableSharedFlow<MeshEvent>(extraBufferCapacity = 128)
-    val events: SharedFlow<MeshEvent> = _events.asSharedFlow()
+    private val _events = MutableSharedFlow<TelemetryEvent>(extraBufferCapacity = 128)
+    val events: SharedFlow<TelemetryEvent> = _events.asSharedFlow()
 
-    // In-memory rolling window (last 200 events)
-    private val _window = ArrayDeque<MeshEvent>(200)
-    val recentEvents: List<MeshEvent> get() = _window.toList()
+    private val window = ArrayDeque<TelemetryEvent>(200)
 
-    fun record(event: MeshEvent) {
-        if (_window.size >= 200) _window.removeFirst()
-        _window.addLast(event)
+    fun record(
+        taskId: String,
+        nodeId: String,
+        latencyMs: Long,
+        success: Boolean,
+        transportLayer: String,
+        costUsd: Double = 0.0
+    ) {
+        val event = TelemetryEvent(taskId, nodeId, latencyMs, costUsd, success, transportLayer)
+        if (window.size >= 200) window.removeFirst()
+        window.addLast(event)
 
         scope.launch {
             _events.emit(event)
             runCatching { agentRepository.upsertEvent(event) }
-                .onFailure { Timber.e(it, "[Telemetry] Persist failed for task ${event.taskId}") }
+                .onFailure { Timber.e(it, "[Telemetry] Persist failed for $taskId") }
         }
-        Timber.d("[Telemetry] task=${event.taskId} success=${event.success} lat=${event.latencyMs}ms cost=\$${event.costUsd}")
+
+        Timber.d("[Telemetry] task=$taskId success=$success lat=${latencyMs}ms transport=$transportLayer")
     }
 
-    /** Aggregate stats for dashboard widgets. */
     fun stats(): TelemetryStats {
-        val events = recentEvents
+        val events = window.toList()
         if (events.isEmpty()) return TelemetryStats()
         val successes = events.count { it.success }
         return TelemetryStats(
-            totalTasks     = events.size,
-            successRate    = successes.toDouble() / events.size,
-            avgLatencyMs   = events.map { it.latencyMs }.average().toLong(),
-            totalCostUsd   = events.sumOf { it.costUsd },
-            localTaskPct   = events.count { it.transportLayer == "LOCAL" }.toDouble() / events.size,
+            totalTasks      = events.size,
+            successRate     = successes.toDouble() / events.size,
+            avgLatencyMs    = events.map { it.latencyMs }.average().toLong(),
+            totalCostUsd    = events.sumOf { it.costUsd },
+            localTaskPct    = events.count { it.transportLayer == "LOCAL" }.toDouble() / events.size,
             activeTransport = events.lastOrNull()?.transportLayer ?: "NONE"
         )
     }
+
+    fun recentEvents(): List<TelemetryEvent> = window.toList()
 }
+
+data class TelemetryEvent(
+    val taskId: String,
+    val nodeId: String,
+    val latencyMs: Long,
+    val costUsd: Double,
+    val success: Boolean,
+    val transportLayer: String,
+    val timestampMs: Long = System.currentTimeMillis()
+)
 
 data class TelemetryStats(
     val totalTasks: Int       = 0,

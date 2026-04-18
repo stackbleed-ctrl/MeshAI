@@ -1,5 +1,6 @@
-package com.meshai.core.model
+package com.meshai.agent
 
+import com.meshai.mesh.NodeAdvertisement
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -9,96 +10,103 @@ import javax.inject.Inject
 import javax.inject.Singleton
 
 /**
- * CapabilityRegistry — the brain of mesh routing.
+ * CapabilityRegistry — reliability-aware routing brain.
  *
- * Nodes self-advertise their capabilities via NODE_ADVERTISE envelopes.
- * MeshRouter consults this registry before delegating any task.
+ * ## What changed (Option A — Resilience)
  *
- * SPEC_REF: CAP-002
+ * The previous version scored nodes on battery level and agent mode only.
+ * Neither tells you whether a node actually *succeeds* at tasks.
+ *
+ * Now [bestNodeForCapability] combines:
+ * - Battery level (40% weight) — don't delegate to a dying device
+ * - Agent Mode bonus (30% weight) — owner-away nodes are more available
+ * - Reliability score from [ReliabilityScorer] (30% weight) — telemetry-driven
+ *
+ * A node with 95% success rate and 200ms average latency beats one with
+ * 60% success rate at 80ms. Routing becomes empirically grounded.
+ *
+ * SPEC_REF: CAP-001 / OPTION-A
  */
 @Singleton
-class CapabilityRegistry @Inject constructor() {
-
-    // nodeId → list of capabilities for that node
-    private val _registry = MutableStateFlow<Map<String, List<Capability>>>(emptyMap())
-    val registry: StateFlow<Map<String, List<Capability>>> = _registry.asStateFlow()
-
-    /**
-     * Register (or refresh) capabilities advertised by a remote node.
-     * Called when a NODE_ADVERTISE envelope is received.
-     */
-    fun advertise(capabilities: List<Capability>) {
-        if (capabilities.isEmpty()) return
-        val nodeId = capabilities.first().deviceId
-        _registry.update { it + (nodeId to capabilities) }
-        Timber.d("[CapabilityRegistry] Registered ${capabilities.size} caps for node $nodeId")
+class CapabilityRegistry @Inject constructor(
+    private val reliabilityScorer: ReliabilityScorer
+) {
+    companion object {
+        const val STALE_THRESHOLD_MS = 30_000L
+        private const val WEIGHT_BATTERY     = 0.40
+        private const val WEIGHT_AGENT_MODE  = 30.0
+        private const val WEIGHT_RELIABILITY = 30.0
     }
 
-    /**
-     * Remove a node that has gone offline.
-     */
+    private val _registry = MutableStateFlow<Map<String, NodeAdvertisement>>(emptyMap())
+    val registry: StateFlow<Map<String, NodeAdvertisement>> = _registry.asStateFlow()
+
+    fun advertise(ad: NodeAdvertisement) {
+        _registry.update { it + (ad.nodeId to ad) }
+        Timber.d("[CapReg] Updated ${ad.nodeId}: caps=${ad.capabilities} bat=${ad.batteryLevel}%")
+    }
+
     fun evict(nodeId: String) {
         _registry.update { it - nodeId }
-        Timber.d("[CapabilityRegistry] Evicted node $nodeId")
+        reliabilityScorer.reset(nodeId)
+        Timber.d("[CapReg] Evicted $nodeId")
     }
 
     /**
-     * Find the best node to handle a given task.
+     * Find the best remote node for [capabilityName].
      *
-     * Selection criteria (in order):
-     * 1. Must have the required capability name.
-     * 2. Must not be stale.
-     * 3. Must be available.
-     * 4. Lowest routing score (latency + cost + battery penalty).
-     *
-     * Returns null if no suitable node exists → task must run locally or be queued.
+     * Composite score = battery (40%) + agentMode (30%) + reliability (30%).
+     * Returns null if no suitable remote node → execute locally.
      */
-    fun bestNode(
+    fun bestNodeForCapability(
         capabilityName: String,
-        excludeNodeId: String? = null,
-        constraints: TaskConstraints = TaskConstraints()
-    ): Capability? {
+        excludeNodeId: String,
+        minBatteryPct: Int = 20
+    ): NodeAdvertisement? {
         pruneStale()
-        return _registry.value
-            .values
-            .flatten()
-            .filter { cap ->
-                cap.name == capabilityName &&
-                cap.availability &&
-                !cap.isStale() &&
-                cap.deviceId != excludeNodeId &&
-                cap.latencyMs <= constraints.maxLatencyMs &&
-                cap.costUsd   <= constraints.maxCostUsd
+        return _registry.value.values
+            .filter { ad ->
+                ad.nodeId != excludeNodeId &&
+                capabilityName in ad.capabilities &&
+                ad.batteryLevel >= minBatteryPct &&
+                !isStale(ad)
             }
-            .minByOrNull { it.routingScore() }
+            .maxByOrNull { ad -> compositeScore(ad) }
             .also {
-                if (it != null)
-                    Timber.d("[CapabilityRegistry] Best node for '$capabilityName': ${it.deviceId} (score=${it.routingScore()})")
-                else
-                    Timber.w("[CapabilityRegistry] No node found for '$capabilityName'")
+                if (it != null) {
+                    val rel = reliabilityScorer.scoreOf(it.nodeId)
+                    Timber.d("[CapReg] Best for '$capabilityName': ${it.nodeId} " +
+                        "(bat=${it.batteryLevel}% rel=${"%.2f".format(rel)})")
+                } else {
+                    Timber.d("[CapReg] No remote node for '$capabilityName'")
+                }
             }
     }
 
     /**
-     * Return all currently known nodes and their capability sets.
-     * Used by the dashboard to populate the node grid.
+     * Record a task outcome for a node — feeds [ReliabilityScorer].
+     * Call this from [TelemetryCollector.record] or [MeshKernel] after task completion.
      */
-    fun allNodes(): Map<String, List<Capability>> =
-        _registry.value.filterValues { caps -> caps.any { !it.isStale() } }
+    fun recordOutcome(nodeId: String, success: Boolean, latencyMs: Long) {
+        reliabilityScorer.record(nodeId, success, latencyMs)
+    }
 
-    /** Count of live (non-stale) remote nodes. */
-    fun liveNodeCount(): Int = allNodes().size
+    fun liveNodes(): List<NodeAdvertisement> {
+        pruneStale(); return _registry.value.values.toList()
+    }
+    fun liveNodeCount(): Int = liveNodes().size
+
+    private fun compositeScore(ad: NodeAdvertisement): Double {
+        val batteryScore      = ad.batteryLevel * WEIGHT_BATTERY
+        val agentModeScore    = if (!ad.isOwnerPresent) WEIGHT_AGENT_MODE else 0.0
+        val reliabilityScore  = reliabilityScorer.scoreOf(ad.nodeId) * WEIGHT_RELIABILITY
+        return batteryScore + agentModeScore + reliabilityScore
+    }
+
+    private fun isStale(ad: NodeAdvertisement): Boolean =
+        System.currentTimeMillis() - ad.advertisedAtMs > STALE_THRESHOLD_MS
 
     private fun pruneStale() {
-        _registry.update { current ->
-            current.mapValues { (_, caps) -> caps.filter { !it.isStale() } }
-                   .filterValues { it.isNotEmpty() }
-        }
+        _registry.update { current -> current.filterValues { !isStale(it) } }
     }
 }
-
-/** Constraints passed alongside a task for routing decisions. */
-data class TaskConstraints(
-    val maxCostUsd: Double = 0.05,
-    val maxLatencyMs: Int  = 5_000
-)
