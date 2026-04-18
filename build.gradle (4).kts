@@ -5,19 +5,9 @@ plugins {
     id("kotlin-kapt")
     id("org.jetbrains.kotlin.plugin.serialization")
 }
-
-android {
-    namespace = "com.meshai.transport"
-    compileSdk = 34
-    defaultConfig { minSdk = 26 }
-}
-
 dependencies {
-    implementation(project(":core:protocol"))
     implementation(project(":core:model"))
-    implementation("com.google.android.gms:play-services-nearby:19.1.0")
-    implementation("com.jakewharton.timber:timber:5.0.1")
-    implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.6.3")
+    implementation(project(":core:protocol"))
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
     kapt("com.google.dagger:hilt-android-compiler:2.50")
 }

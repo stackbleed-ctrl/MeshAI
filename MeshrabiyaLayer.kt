@@ -1,93 +1,42 @@
-package com.meshai.mesh
+package com.meshai.transport
 
-import android.content.Context
-import com.meshai.agent.AgentNode
-import dagger.hilt.android.qualifiers.ApplicationContext
+import com.meshai.core.model.AgentTask
+import com.meshai.core.protocol.MeshMessage
+import com.meshai.core.protocol.MessageStatus
 import timber.log.Timber
+import java.util.UUID
 import javax.inject.Inject
+import javax.inject.Singleton
 
 /**
- * Wi-Fi mesh layer powered by Meshrabiya.
- *
- * Meshrabiya (github.com/ustadmobile/meshrabiya) creates a multi-hop
- * Wi-Fi mesh with virtual IP addresses (10.241.x.x/16), allowing full
- * TCP/UDP socket communication between Android devices without internet.
- *
- * Features:
- * - WPA3 encrypted Wi-Fi Direct connections
- * - Virtual IP routing (each node gets a stable 10.241.x.x address)
- * - Multi-hop: messages route through intermediate nodes
- * - True peer-to-peer: no central access point required
- *
- * Integration notes:
- * - Meshrabiya runs as a VirtualMeshNode that creates a local hotspot + VPN
- * - Other nodes connect as hotspot clients
- * - The library handles all routing internally
- * - Requires NEARBY_WIFI_DEVICES permission on Android 13+
+ * Wi-Fi Direct multi-hop mesh via Meshrabiya.
+ * Provides true multi-hop routing with virtual IPs over Wi-Fi Direct.
+ * Requires NEARBY_WIFI_DEVICES permission (API 33+).
  */
-class MeshrabiyaLayer @Inject constructor(
-    @ApplicationContext private val context: Context
-) {
+@Singleton
+class MeshrabiyaLayer @Inject constructor() : MeshTransport {
 
-    // Callbacks set by MeshNetwork
-    var onMessage: ((ByteArray) -> Unit)? = null
-    var onPeerChanged: ((List<AgentNode>) -> Unit)? = null
+    private var connected = false
+    private var peers = 0
 
-    private val connectedPeers = mutableMapOf<String, AgentNode>()
-    private var isRunning = false
+    // TODO: Initialise Meshrabiya node:
+    // val meshrabiyaNode = MeshrabiyaNode.newInstance(context, config)
+    // meshrabiyaNode.state.collect { state -> connected = state.wifiState == CONNECTED }
 
-    /**
-     * Start the Meshrabiya mesh node.
-     *
-     * In production, this initializes VirtualMeshNode from the Meshrabiya
-     * library and starts listening on a virtual network interface.
-     *
-     * Example Meshrabiya initialization:
-     * ```kotlin
-     * val meshNode = VirtualMeshNode(
-     *     context = context,
-     *     config = MeshrabiyaConfig(
-     *         meshPrefix = InetAddress.getByName("10.241.0.0"),
-     *         virtualNodeIpv4Address = generateVirtualIp(localNode.nodeId),
-     *         hotspotConfig = MeshrabiyaHotspotConfig(
-     *             ssid = "MeshAI-${localNode.nodeId.take(8)}",
-     *             passphrase = generateNetworkPassphrase()
-     *         )
-     *     )
-     * )
-     * meshNode.start()
-     * meshNode.meshPacketListener = { packet -> onMessage?.invoke(packet.data) }
-     * meshNode.nodeStatusListener = { nodes -> onPeerChanged?.invoke(nodes.map { it.toAgentNode() }) }
-     * ```
-     */
-    fun start(localNode: AgentNode) {
-        if (isRunning) return
-        isRunning = true
-        Timber.i("[Meshrabiya] Starting Wi-Fi mesh node for ${localNode.displayName}")
-        // TODO: Initialize actual Meshrabiya VirtualMeshNode here
-        // Requires NEARBY_WIFI_DEVICES + ACCESS_FINE_LOCATION permissions
-        Timber.d("[Meshrabiya] Wi-Fi Direct mesh active (stub — wire up VirtualMeshNode)")
+    override suspend fun send(task: AgentTask): MeshMessage {
+        Timber.d("[Meshrabiya] Sending task ${task.taskId}")
+        // TODO: serialise task → meshrabiyaNode.send(virtualIp, payload)
+        return MeshMessage(
+            messageId       = UUID.randomUUID().toString(),
+            taskId          = task.taskId,
+            senderNodeId    = "local",
+            recipientNodeId = null,
+            payload         = "pending meshrabiya integration",
+            status          = MessageStatus.PENDING,
+            costUsd         = 0.001
+        )
     }
 
-    fun stop() {
-        isRunning = false
-        connectedPeers.clear()
-        Timber.i("[Meshrabiya] Mesh stopped")
-    }
-
-    fun send(targetNodeId: String, payload: ByteArray) {
-        if (!isRunning) return
-        Timber.d("[Meshrabiya] Sending ${payload.size} bytes to $targetNodeId")
-        // TODO: meshNode.sendPacket(targetVirtualIp, payload)
-    }
-
-    fun broadcast(payload: ByteArray) {
-        if (!isRunning) return
-        Timber.d("[Meshrabiya] Broadcasting ${payload.size} bytes to all mesh nodes")
-        // TODO: meshNode.broadcastPacket(payload)
-    }
-
-    fun isConnected(nodeId: String): Boolean = connectedPeers.containsKey(nodeId)
-
-    fun peerCount(): Int = connectedPeers.size
+    override fun isConnected() = connected
+    override fun peerCount() = peers
 }
