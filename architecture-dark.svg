@@ -1,0 +1,78 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 560" width="900" height="560" font-family="ui-monospace, 'Cascadia Code', 'Fira Code', monospace">
+
+  <!-- Background -->
+  <rect width="900" height="560" rx="12" fill="#0d1117"/>
+
+  <!-- Title -->
+  <text x="450" y="38" text-anchor="middle" font-size="17" font-weight="700" fill="#e6edf3" letter-spacing="1">MeshAI — System Architecture</text>
+
+  <!-- UI Layer -->
+  <rect x="40" y="60" width="820" height="72" rx="8" fill="#121d2f" stroke="#388bfd" stroke-width="1.5"/>
+  <text x="60" y="83" font-size="11" font-weight="700" fill="#58a6ff" letter-spacing="0.5">UI LAYER</text>
+  <text x="60" y="103" font-size="12" fill="#e6edf3">Jetpack Compose · Material 3 · Dashboard · Mesh Map · Agent Console</text>
+  <text x="60" y="120" font-size="11" fill="#8b949e">DashboardScreen  ·  OtherScreens  ·  DashboardViewModel  ·  MeshAINavGraph  ·  Theme  ·  Typography</text>
+
+  <!-- Agent Core Layer -->
+  <rect x="40" y="148" width="820" height="72" rx="8" fill="#1e1a00" stroke="#bb8009" stroke-width="1.5"/>
+  <text x="60" y="171" font-size="11" font-weight="700" fill="#e3b341" letter-spacing="0.5">AGENT CORE LAYER</text>
+  <text x="60" y="191" font-size="12" fill="#e6edf3">ReAct Loop · Goal Decomposition · Short-Term Memory · Planning · Owner Detection</text>
+  <text x="60" y="208" font-size="11" fill="#8b949e">ReActLoop  ·  GoalEngine  ·  AgentMemory  ·  AgentNode  ·  AgentTask  ·  AgentWorker  ·  OwnerPresenceDetector</text>
+
+  <!-- LLM Layer -->
+  <rect x="40" y="236" width="248" height="120" rx="8" fill="#2d1317" stroke="#f85149" stroke-width="1.5"/>
+  <text x="60" y="258" font-size="11" font-weight="700" fill="#ff7b72" letter-spacing="0.5">LLM LAYER</text>
+  <text x="60" y="277" font-size="12" fill="#e6edf3">Gemini Nano (AICore)</text>
+  <text x="60" y="294" font-size="12" fill="#e6edf3">Gemma 2B / 7B</text>
+  <text x="60" y="311" font-size="12" fill="#e6edf3">MediaPipe LLM Inference</text>
+  <text x="60" y="328" font-size="11" fill="#8b949e">LlmEngine  ·  CallTool abstraction</text>
+  <text x="60" y="345" font-size="11" fill="#8b949e">On-device · no API key</text>
+
+  <!-- Tool Layer -->
+  <rect x="326" y="236" width="248" height="120" rx="8" fill="#0d2119" stroke="#3fb950" stroke-width="1.5"/>
+  <text x="346" y="258" font-size="11" font-weight="700" fill="#3fb950" letter-spacing="0.5">TOOL LAYER</text>
+  <text x="346" y="277" font-size="12" fill="#e6edf3">SMS · Calls · Notifications</text>
+  <text x="346" y="294" font-size="12" fill="#e6edf3">Camera · GPS · Sensors</text>
+  <text x="346" y="311" font-size="12" fill="#e6edf3">Shell · File I/O</text>
+  <text x="346" y="328" font-size="11" fill="#8b949e">ToolRegistry  ·  SmsTool  ·  CallTool</text>
+  <text x="346" y="345" font-size="11" fill="#8b949e">CameraTool  ·  LocationTool</text>
+
+  <!-- Mesh Layer -->
+  <rect x="612" y="236" width="248" height="120" rx="8" fill="#1a0f2e" stroke="#bc8cff" stroke-width="1.5"/>
+  <text x="632" y="258" font-size="11" font-weight="700" fill="#bc8cff" letter-spacing="0.5">MESH LAYER</text>
+  <text x="632" y="277" font-size="12" fill="#e6edf3">Meshrabiya (Wi-Fi multi-hop)</text>
+  <text x="632" y="294" font-size="12" fill="#e6edf3">Google Nearby Connections</text>
+  <text x="632" y="311" font-size="12" fill="#e6edf3">BLE GATT (low-power)</text>
+  <text x="632" y="328" font-size="11" fill="#8b949e">MeshNetwork  ·  MeshrabiyaLayer</text>
+  <text x="632" y="345" font-size="11" fill="#8b949e">NearbyLayer  ·  BleGattLayer</text>
+
+  <!-- Connectors -->
+  <defs>
+    <marker id="arr" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#8b949e"/>
+    </marker>
+  </defs>
+  <line x1="288" y1="296" x2="326" y2="296" stroke="#8b949e" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#arr)"/>
+  <line x1="574" y1="296" x2="612" y2="296" stroke="#8b949e" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#arr)"/>
+
+  <!-- Infrastructure Layer -->
+  <rect x="40" y="372" width="820" height="72" rx="8" fill="#161b22" stroke="#30363d" stroke-width="1.5"/>
+  <text x="60" y="395" font-size="11" font-weight="700" fill="#8b949e" letter-spacing="0.5">INFRASTRUCTURE LAYER</text>
+  <text x="60" y="415" font-size="12" fill="#e6edf3">Room DB · DataStore · Hilt · Coroutines · Flow · Jetpack Security · WorkManager</text>
+  <text x="60" y="432" font-size="11" fill="#8b949e">MeshAIDatabase  ·  AgentRepository  ·  AppModule  ·  MeshEncryption  ·  AgentForegroundService  ·  BootReceiver</text>
+
+  <!-- Security Layer -->
+  <rect x="40" y="460" width="820" height="72" rx="8" fill="#2d1a0e" stroke="#db6d28" stroke-width="1.5"/>
+  <text x="60" y="483" font-size="11" font-weight="700" fill="#f0883e" letter-spacing="0.5">SECURITY &amp; RUNTIME</text>
+  <text x="60" y="503" font-size="12" fill="#e6edf3">Noise Protocol (mesh encryption) · AES-256-GCM (local storage) · Age (cross-node keys) · WPA3</text>
+  <text x="60" y="520" font-size="11" fill="#8b949e">MeshMessage  ·  MeshEncryption  ·  MeshEncryptionTest  ·  AndroidManifest permissions gating</text>
+
+  <!-- Vertical arrows -->
+  <line x1="450" y1="132" x2="450" y2="148" stroke="#8b949e" stroke-width="1.5" marker-end="url(#arr)"/>
+  <line x1="450" y1="220" x2="450" y2="236" stroke="#8b949e" stroke-width="1.5" marker-end="url(#arr)"/>
+  <line x1="450" y1="356" x2="450" y2="372" stroke="#8b949e" stroke-width="1.5" marker-end="url(#arr)"/>
+  <line x1="450" y1="444" x2="450" y2="460" stroke="#8b949e" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <!-- Legend -->
+  <text x="450" y="548" text-anchor="middle" font-size="10" fill="#484f58">Radio fallback order: Meshrabiya (Wi-Fi) → Nearby (BT+WiFi) → BLE GATT → Cellular/Wi-Fi</text>
+
+</svg>
