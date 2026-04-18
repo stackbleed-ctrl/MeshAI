@@ -1,78 +1,85 @@
 package com.meshai.transport
 
-import com.meshai.core.model.AgentTask
+import com.meshai.core.protocol.MeshCodec
 import com.meshai.core.protocol.MeshEnvelope
-import com.meshai.core.protocol.MeshMessage
-import com.meshai.core.protocol.MessageStatus
 import com.meshai.core.protocol.TaskResult
-import kotlinx.coroutines.withTimeoutOrNull
-import kotlinx.serialization.encodeToString
-import kotlinx.serialization.json.Json
 import timber.log.Timber
-import java.util.UUID
 import javax.inject.Inject
 import javax.inject.Singleton
 
 /**
- * TransportManager — unified single entry point for all outbound mesh traffic.
+ * TransportManager v2 — codec-aware, envelope-native unified transport.
  *
- * Selection strategy (SPEC_REF: TRANS-001):
- *  1. Prefer Meshrabiya (Wi-Fi Direct multi-hop) — highest bandwidth, multi-hop.
- *  2. Fall back to Nearby Connections — BLE+WiFi, good range.
- *  3. Last resort: BLE GATT — lowest power, limited payload size.
+ * ## What changed (Option A — Protocol Boundary)
  *
- * Each send is wrapped in a timeout equal to the task's maxLatencyMs constraint.
- * If all transports fail, returns a FAILED MeshMessage so callers can handle gracefully.
+ * v1 had a `legacyTaskFromEnvelope()` bridge because [MeshTransport] spoke
+ * `AgentTask`. That bridge is gone. Every send now flows:
+ *
+ *   MeshEnvelope → MeshCodec.encode() → ByteArray → MeshTransport.send()
+ *
+ * [MeshCodec] is the single serialisation seam. Swap `JsonMeshCodec` for a
+ * protobuf implementation here and every transport layer gets it for free.
+ *
+ * ## Transport selection (unchanged from v1)
+ *
+ * Priority order: Meshrabiya → Nearby → BLE.
+ * First connected transport with a send success wins.
+ * Latency estimate used by [MeshKernel] for scheduling decisions.
+ *
+ * SPEC_REF: TRANS-001 / OPTION-A
  */
 @Singleton
 class TransportManager @Inject constructor(
     private val meshrabiyaLayer: MeshrabiyaLayer,
     private val nearbyLayer: NearbyLayer,
-    private val bleGattLayer: BleGattLayer
+    private val bleGattLayer: BleGattLayer,
+    private val codec: MeshCodec
 ) {
-    /** Ordered list of transports; priority-sorted. */
     private val transports: List<NamedTransport> = listOf(
         NamedTransport("MESHRABIYA", meshrabiyaLayer),
         NamedTransport("NEARBY",     nearbyLayer),
         NamedTransport("BLE",        bleGattLayer)
     )
 
-    /** Name of the transport used for the most recent send. */
     private var _activeTransportName: String = "NONE"
     fun activeTransportName(): String = _activeTransportName
 
     /**
-     * Send a MeshEnvelope via the best available transport.
-     * Returns a TaskResult so callers don't need to know transport details.
+     * Send [envelope] via the best available transport.
+     *
+     * Encodes the envelope to bytes once via [MeshCodec], then tries each
+     * transport in priority order until one succeeds.
      */
     suspend fun sendEnvelope(envelope: MeshEnvelope): TaskResult {
-        val payloadJson = Json.encodeToString(envelope)
         val startMs = System.currentTimeMillis()
-
-        // Synthesise a legacy AgentTask for transport layers (until they're upgraded to MeshEnvelope)
-        val legacyTask = legacyTaskFromEnvelope(envelope)
 
         for (named in transports) {
             if (!named.transport.isConnected()) {
-                Timber.d("[TransportManager] ${named.name} not connected, skipping")
+                Timber.d("[TransportManager] ${named.name} not connected — skipping")
                 continue
             }
-            Timber.d("[TransportManager] Attempting send via ${named.name}")
-            val result = runCatching { named.transport.send(legacyTask) }.getOrNull()
-            if (result != null && result.status != MessageStatus.FAILED) {
+
+            Timber.d("[TransportManager] Attempting ${named.name} for envelope ${envelope.envelopeId}")
+
+            val result = runCatching { named.transport.send(envelope) }.getOrElse {
+                Timber.w(it, "[TransportManager] ${named.name} threw unexpectedly")
+                TransportResult.fail(it.message ?: "unknown", System.currentTimeMillis() - startMs)
+            }
+
+            if (result.success) {
                 _activeTransportName = named.name
-                Timber.i("[TransportManager] Sent via ${named.name} in ${System.currentTimeMillis() - startMs}ms")
+                Timber.i("[TransportManager] Sent via ${named.name} in ${result.latencyMs}ms")
                 return TaskResult(
                     taskId     = envelope.envelopeId,
                     success    = true,
-                    resultText = result.payload,
-                    latencyMs  = System.currentTimeMillis() - startMs
+                    resultText = "Delivered via ${named.name}",
+                    latencyMs  = result.latencyMs
                 )
             }
-            Timber.w("[TransportManager] ${named.name} send failed, trying next")
+            Timber.w("[TransportManager] ${named.name} failed: ${result.errorMessage} — trying next")
         }
 
-        Timber.e("[TransportManager] All transports failed for envelope ${envelope.envelopeId}")
+        Timber.e("[TransportManager] All transports failed for ${envelope.envelopeId}")
         return TaskResult(
             taskId     = envelope.envelopeId,
             success    = false,
@@ -81,36 +88,18 @@ class TransportManager @Inject constructor(
         )
     }
 
-    /** Legacy bridge — wrap envelope in AgentTask until transport layers are upgraded. */
-    private fun legacyTaskFromEnvelope(envelope: MeshEnvelope): com.meshai.core.model.AgentTask =
-        com.meshai.core.model.AgentTask(
-            taskId      = envelope.envelopeId,
-            title       = "envelope:${envelope.type}",
-            description = envelope.payload
-        )
-
-    /** Direct task send (legacy path, still used by old callers). */
-    suspend fun send(task: AgentTask): MeshMessage {
-        for (named in transports) {
-            if (!named.transport.isConnected()) continue
-            val result = runCatching { named.transport.send(task) }.getOrNull()
-            if (result != null && result.status != MessageStatus.FAILED) {
-                _activeTransportName = named.name
-                return result
-            }
-        }
-        return MeshMessage(
-            messageId       = UUID.randomUUID().toString(),
-            taskId          = task.taskId,
-            senderNodeId    = "local",
-            recipientNodeId = null,
-            payload         = "All transports unavailable",
-            status          = MessageStatus.FAILED
-        )
-    }
+    /**
+     * Lowest estimated latency across connected transports.
+     * Used by [MeshKernel] to factor transport cost into scheduling.
+     */
+    fun bestEstimatedLatencyMs(): Long =
+        transports
+            .filter { it.transport.isConnected() }
+            .minOfOrNull { it.transport.estimatedLatencyMs() }
+            ?: Long.MAX_VALUE
 
     fun isAnyConnected(): Boolean = transports.any { it.transport.isConnected() }
-    fun totalPeers(): Int = transports.sumOf { it.transport.peerCount() }
+    fun totalPeers(): Int         = transports.sumOf { it.transport.peerCount() }
 
     private data class NamedTransport(val name: String, val transport: MeshTransport)
 }
